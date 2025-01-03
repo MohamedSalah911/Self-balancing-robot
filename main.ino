@@ -8,34 +8,41 @@
 #endif
 
 #define MIN_ABS_SPEED 80
+#define MAX_TURN_SPEED 150 // Cap the turning speed
+#define OBSTACLE_DISTANCE 20 // Minimum distance to detect obstacle (in cm)
+#define TURN_EXTENSION_DURATION 70 // Extra time (ms) to keep turning after avoiding obstacle
+#define SPEED_RAMP_STEP 20 // Step size to increase/decrease speed
+#define SPEED_RAMP_INTERVAL 50 // Interval (ms) for speed ramping
+#define OBSTACLE_COOLDOWN 500 // Cooldown period after turning (in ms)
+
+// Ultrasonic Sensor Pins
+#define trigPin 3
+#define echoPin 2
 
 MPU6050 mpu;
 
-// MPU control/status vars
-bool dmpReady = false;  // set true if DMP init was successful
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
+bool dmpReady = false;
+uint8_t devStatus;
+uint16_t packetSize;
+uint16_t fifoCount;
+uint8_t fifoBuffer[64];
 
-// orientation/motion vars
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];        
 
 // PID
-double setpoint = 0.0;  // Target angle is 0 (upright position)
+double setpoint = 0; // Initial setpoint
 double input, output;
-double Kp =4; 
-double Kd = 1;        // Proportional to angular velocity feedback
-double Ki = 100;
-double KdVelocity = 0.1; // Scaling factor for angular velocity
+double Kp = 4;
+double Kd = 0.4; 
+double Ki = 105;
+double KdVelocity = 0.1;
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 double motorSpeedFactorLeft = 0.5;
 double motorSpeedFactorRight = 0.5;
 
-// MOTOR CONTROLLER
 int ENA = 10;
 int IN1 = 5;
 int IN2 = 4;
@@ -44,10 +51,55 @@ int IN4 = 6;
 int ENB = 11;
 LMotorController motorController(ENA, IN1, IN2, ENB, IN3, IN4, motorSpeedFactorLeft, motorSpeedFactorRight);
 
+volatile unsigned long echoStartTime = 0;
+volatile unsigned long echoEndTime = 0;
+volatile bool measuringDistance = false;
+
+bool turningLeft = false;         // Track if turning left
+bool rampingSpeed = false;        // Track if ramping speed after turning
+unsigned long turnStartTime = 0; // Track when turning started
+unsigned long lastObstacleTime = 0; // Time of the last obstacle encounter
+
+double currentSpeed = MIN_ABS_SPEED; // Current speed for ramping
+unsigned long lastSpeedUpdateTime = 0; // Last time speed was updated for ramping
+
+void triggerUltrasonic() {
+    if (!measuringDistance) {
+        digitalWrite(trigPin, LOW);
+        delayMicroseconds(2);
+        digitalWrite(trigPin, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(trigPin, LOW);
+        measuringDistance = true;
+        echoStartTime = micros();
+    }
+}
+
+float getDistance() {
+    if (measuringDistance && echoEndTime > echoStartTime) {
+        unsigned long duration = echoEndTime - echoStartTime;
+        measuringDistance = false; // Reset for next measurement
+        return (duration * 0.034) / 2.0;
+    }
+    return -1; // Distance not ready
+}
+
+void echoISR() {
+    if (digitalRead(echoPin) == HIGH) {
+        echoStartTime = micros();
+    } else {
+        echoEndTime = micros();
+    }
+}
+
 void setup() {
+    pinMode(trigPin, OUTPUT);
+    pinMode(echoPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(echoPin), echoISR, CHANGE);
+
     #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
         Wire.begin();
-        TWBR = 24; // 400kHz I2C clock (200kHz if CPU is 8MHz)
+        TWBR = 24;
     #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
         Fastwire::setup(400, true);
     #endif
@@ -90,6 +142,22 @@ void setup() {
     }
 }
 
+void rampSpeed(double targetSpeed) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastSpeedUpdateTime >= SPEED_RAMP_INTERVAL) {
+        if (currentSpeed < targetSpeed) {
+            currentSpeed = min(currentSpeed + SPEED_RAMP_STEP, targetSpeed);
+        } else if (currentSpeed > targetSpeed) {
+            currentSpeed = max(currentSpeed - SPEED_RAMP_STEP, targetSpeed);
+        }
+        lastSpeedUpdateTime = currentTime;
+
+        if (currentSpeed == targetSpeed) {
+            rampingSpeed = false; // Stop ramping once the target speed is reached
+        }
+    }
+}
+
 void loop() {
     if (!dmpReady) return;
 
@@ -97,24 +165,59 @@ void loop() {
 
     if (fifoCount >= packetSize) {
         mpu.getFIFOBytes(fifoBuffer, packetSize);
-
         mpu.dmpGetQuaternion(&q, fifoBuffer);
         mpu.dmpGetGravity(&gravity, &q);
         mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+        double rollAngle = ypr[2] * 180 * 1.6 / M_PI;
+        double angularVelocity = mpu.getRotationZ() / 131.0;
 
-        // Extract angular velocity (roll rate) from gyroscope
-        double rollAngle = ypr[2] * 180 *1.6 / M_PI;  // Roll angle in degrees
-        double angularVelocity = mpu.getRotationZ() / 131.0;  // Gyro roll rate in degrees/second
-
-        // Combine roll angle and angular velocity for PID input
         input = rollAngle + angularVelocity * KdVelocity;
-
         pid.Compute();
-        motorController.move(output, MIN_ABS_SPEED);
 
-        // Debugging information
+        // Non-blocking ultrasonic distance measurement
+        triggerUltrasonic();
+        float distance = getDistance();
+
+        // Obstacle avoidance logic
+        if (distance > 0) { // Valid distance measurement
+            Serial.print("Distance: ");
+            Serial.println(distance);
+
+            if (distance < OBSTACLE_DISTANCE && millis() - lastObstacleTime > OBSTACLE_COOLDOWN) {
+                turningLeft = true;                // Start turning
+                rampingSpeed = false;              // Disable ramping during turning
+                currentSpeed = MIN_ABS_SPEED;      // Reset speed to minimum
+                lastObstacleTime = millis();       // Record time of obstacle detection
+                turnStartTime = millis();          // Record start time of turn
+                Serial.println("Obstacle detected! Starting turn left.");
+            }
+        }
+
+        // Continue turning with balancing
+        if (turningLeft) {
+            if (millis() - turnStartTime <= TURN_EXTENSION_DURATION) {
+                motorController.turnLeft(MAX_TURN_SPEED, false); 
+                Serial.println("Turning left.");
+                return; // Skip normal movement while turning
+            } else {
+                turningLeft = false; // Stop turning after extension
+                rampingSpeed = true; // Enable ramping after turning
+                Serial.println("Turning complete. Resuming normal operation.");
+            }
+        }
+
+        // Ramping speed after turning
+        if (rampingSpeed) {
+            rampSpeed(MIN_ABS_SPEED + abs(output));
+        }
+
+        // Normal balancing or movement
+        motorController.move(output, rampingSpeed ? currentSpeed : MIN_ABS_SPEED + abs(output));
+
+        // Debugging
         Serial.print("Roll Angle: "); Serial.print(rollAngle); Serial.print(" | ");
-        Serial.print("Angular Velocity: "); Serial.print(angularVelocity); Serial.print(" | ");
-        Serial.print("PID Output: "); Serial.println(output);
+        Serial.print("Setpoint: "); Serial.print(setpoint); Serial.print(" | ");
+        Serial.print("PID Output: "); Serial.print(output); Serial.print(" | ");
+        Serial.print("Current Speed: "); Serial.println(currentSpeed);
     }
 }
