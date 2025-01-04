@@ -37,7 +37,6 @@ double input, output;
 double Kp = 4;
 double Kd = 0.4; 
 double Ki = 105;
-double KdVelocity = 0.1;
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 double motorSpeedFactorLeft = 0.5;
@@ -116,6 +115,7 @@ void setup() {
     Serial.println(F("Initializing DMP..."));
     devStatus = mpu.dmpInitialize();
 
+    // MPU-6050 Calibration offsets
     mpu.setXGyroOffset(46);
     mpu.setYGyroOffset(15);
     mpu.setZGyroOffset(32);
@@ -168,10 +168,7 @@ void loop() {
         mpu.dmpGetQuaternion(&q, fifoBuffer);
         mpu.dmpGetGravity(&gravity, &q);
         mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-        double rollAngle = ypr[2] * 180 * 1.6 / M_PI;
-        double angularVelocity = mpu.getRotationZ() / 131.0;
-
-        input = rollAngle + angularVelocity * KdVelocity;
+        double input = ypr[2] * 180 * 1.6 / M_PI;
         pid.Compute();
 
         // Non-blocking ultrasonic distance measurement
@@ -215,7 +212,6 @@ void loop() {
         motorController.move(output, rampingSpeed ? currentSpeed : MIN_ABS_SPEED + abs(output));
 
         // Debugging
-        Serial.print("Roll Angle: "); Serial.print(rollAngle); Serial.print(" | ");
         Serial.print("Setpoint: "); Serial.print(setpoint); Serial.print(" | ");
         Serial.print("PID Output: "); Serial.print(output); Serial.print(" | ");
         Serial.print("Current Speed: "); Serial.println(currentSpeed);
